@@ -16,19 +16,17 @@ import (
 	"github.com/kardianos/osext"
 
 	"github.com/jesseduffield/lazygit/pkg/commands/oscommands"
+	"github.com/jesseduffield/lazygit/pkg/common"
 	"github.com/jesseduffield/lazygit/pkg/config"
 	"github.com/jesseduffield/lazygit/pkg/constants"
-	"github.com/jesseduffield/lazygit/pkg/i18n"
 	"github.com/jesseduffield/lazygit/pkg/utils"
-	"github.com/sirupsen/logrus"
 )
 
 // Updater checks for updates and does updates
 type Updater struct {
-	Log       *logrus.Entry
+	*common.Common
 	Config    config.AppConfigurer
 	OSCommand *oscommands.OSCommand
-	Tr        *i18n.TranslationSet
 }
 
 // Updaterer implements the check and update methods
@@ -38,14 +36,11 @@ type Updaterer interface {
 }
 
 // NewUpdater creates a new updater
-func NewUpdater(log *logrus.Entry, config config.AppConfigurer, osCommand *oscommands.OSCommand, tr *i18n.TranslationSet) (*Updater, error) {
-	contextLogger := log.WithField("context", "updates")
-
+func NewUpdater(cmn *common.Common, config config.AppConfigurer, osCommand *oscommands.OSCommand) (*Updater, error) {
 	return &Updater{
-		Log:       contextLogger,
+		Common:    cmn,
 		Config:    config,
 		OSCommand: osCommand,
-		Tr:        tr,
 	}, nil
 }
 
@@ -126,10 +121,8 @@ func (u *Updater) checkForNewUpdate() (string, error) {
 		return "", errors.New(errMessage)
 	}
 
-	rawUrl, err := u.getBinaryUrl(newVersion)
-	if err != nil {
-		return "", err
-	}
+	rawUrl := u.getBinaryUrl(newVersion)
+
 	u.Log.Info("Checking for resource at url " + rawUrl)
 	if !u.verifyResourceFound(rawUrl) {
 		errMessage := utils.ResolvePlaceholderString(
@@ -151,12 +144,10 @@ func (u *Updater) CheckForNewUpdate(onFinish func(string, error) error, userRequ
 		return
 	}
 
-	go utils.Safe(func() {
-		newVersion, err := u.checkForNewUpdate()
-		if err = onFinish(newVersion, err); err != nil {
-			u.Log.Error(err)
-		}
-	})
+	newVersion, err := u.checkForNewUpdate()
+	if err = onFinish(newVersion, err); err != nil {
+		u.Log.Error(err)
+	}
 }
 
 func (u *Updater) skipUpdateCheck() bool {
@@ -177,7 +168,7 @@ func (u *Updater) skipUpdateCheck() bool {
 		return true
 	}
 
-	userConfig := u.Config.GetUserConfig()
+	userConfig := u.UserConfig()
 	if userConfig.Update.Method == "never" {
 		u.Log.Info("Update method is set to never so we won't check for an update")
 		return true
@@ -229,7 +220,7 @@ func (u *Updater) zipExtension() string {
 }
 
 // example: https://github.com/jesseduffield/lazygit/releases/download/v0.1.73/lazygit_0.1.73_Darwin_x86_64.tar.gz
-func (u *Updater) getBinaryUrl(newVersion string) (string, error) {
+func (u *Updater) getBinaryUrl(newVersion string) string {
 	url := fmt.Sprintf(
 		"%s/releases/download/%s/lazygit_%s_%s_%s.%s",
 		constants.Links.RepoUrl,
@@ -240,24 +231,16 @@ func (u *Updater) getBinaryUrl(newVersion string) (string, error) {
 		u.zipExtension(),
 	)
 	u.Log.Info("Url for latest release is " + url)
-	return url, nil
+	return url
 }
 
 // Update downloads the latest binary and replaces the current binary with it
-func (u *Updater) Update(newVersion string, onFinish func(error) error) {
-	go utils.Safe(func() {
-		err := u.update(newVersion)
-		if err = onFinish(err); err != nil {
-			u.Log.Error(err)
-		}
-	})
+func (u *Updater) Update(newVersion string) error {
+	return u.update(newVersion)
 }
 
 func (u *Updater) update(newVersion string) error {
-	rawUrl, err := u.getBinaryUrl(newVersion)
-	if err != nil {
-		return err
-	}
+	rawUrl := u.getBinaryUrl(newVersion)
 	u.Log.Info("Updating with url " + rawUrl)
 	return u.downloadAndInstall(rawUrl)
 }
@@ -300,7 +283,8 @@ func (u *Updater) downloadAndInstall(rawUrl string) error {
 	}
 
 	u.Log.Info("untarring tarball/unzipping zip file")
-	if err := u.OSCommand.RunCommand("tar -zxf %s %s", u.OSCommand.Quote(zipPath), "lazygit"); err != nil {
+	err = u.OSCommand.Cmd.New([]string{"tar", "-zxf", zipPath, "lazygit"}).Run()
+	if err != nil {
 		return err
 	}
 
@@ -340,7 +324,6 @@ func (u *Updater) verifyResourceFound(rawUrl string) bool {
 	}
 	defer resp.Body.Close()
 	u.Log.Info("Received status code ", resp.StatusCode)
-	// 403 means the resource is there (not going to bother adding extra request headers)
-	// 404 means its not
-	return resp.StatusCode == 403
+	// OK (200) indicates that the resource is present.
+	return resp.StatusCode == http.StatusOK
 }

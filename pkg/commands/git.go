@@ -1,260 +1,204 @@
 package commands
 
 import (
-	"io"
-	"io/ioutil"
 	"os"
-	"path/filepath"
-	"strings"
-	"time"
 
 	"github.com/go-errors/errors"
 
-	gogit "github.com/jesseduffield/go-git/v5"
+	"github.com/jesseduffield/lazygit/pkg/commands/git_commands"
 	"github.com/jesseduffield/lazygit/pkg/commands/git_config"
 	"github.com/jesseduffield/lazygit/pkg/commands/oscommands"
 	"github.com/jesseduffield/lazygit/pkg/commands/patch"
+	"github.com/jesseduffield/lazygit/pkg/common"
 	"github.com/jesseduffield/lazygit/pkg/config"
 	"github.com/jesseduffield/lazygit/pkg/env"
-	"github.com/jesseduffield/lazygit/pkg/i18n"
 	"github.com/jesseduffield/lazygit/pkg/utils"
-	"github.com/sirupsen/logrus"
 )
-
-// this takes something like:
-// * (HEAD detached at 264fc6f5)
-//	remotes
-// and returns '264fc6f5' as the second match
-const CurrentBranchNameRegex = `(?m)^\*.*?([^ ]*?)\)?$`
 
 // GitCommand is our main git interface
 type GitCommand struct {
-	Log                  *logrus.Entry
-	OSCommand            *oscommands.OSCommand
-	Repo                 *gogit.Repository
-	Tr                   *i18n.TranslationSet
-	Config               config.AppConfigurer
-	DotGitDir            string
-	onSuccessfulContinue func() error
-	PatchManager         *patch.PatchManager
-	GitConfig            git_config.IGitConfig
+	Blame          *git_commands.BlameCommands
+	Branch         *git_commands.BranchCommands
+	Commit         *git_commands.CommitCommands
+	Config         *git_commands.ConfigCommands
+	Custom         *git_commands.CustomCommands
+	Diff           *git_commands.DiffCommands
+	File           *git_commands.FileCommands
+	Flow           *git_commands.FlowCommands
+	Patch          *git_commands.PatchCommands
+	Rebase         *git_commands.RebaseCommands
+	Remote         *git_commands.RemoteCommands
+	Stash          *git_commands.StashCommands
+	Status         *git_commands.StatusCommands
+	Submodule      *git_commands.SubmoduleCommands
+	Sync           *git_commands.SyncCommands
+	Tag            *git_commands.TagCommands
+	WorkingTree    *git_commands.WorkingTreeCommands
+	Bisect         *git_commands.BisectCommands
+	Worktree       *git_commands.WorktreeCommands
+	Version        *git_commands.GitVersion
+	RepoPaths      *git_commands.RepoPaths
+	GitHub         *git_commands.GitHubCommands
+	HostingService *git_commands.HostingService
 
-	// Push to current determines whether the user has configured to push to the remote branch of the same name as the current or not
-	PushToCurrent bool
-
-	// this is just a view that we write to when running certain commands.
-	// Coincidentally at the moment it's the same view that OnRunCommand logs to
-	// but that need not always be the case.
-	GetCmdWriter func() io.Writer
+	Loaders Loaders
 }
 
-// NewGitCommand it runs git commands
+type Loaders struct {
+	BranchLoader       *git_commands.BranchLoader
+	CommitFileLoader   *git_commands.CommitFileLoader
+	CommitLoader       *git_commands.CommitLoader
+	FileLoader         *git_commands.FileLoader
+	ReflogCommitLoader *git_commands.ReflogCommitLoader
+	RemoteLoader       *git_commands.RemoteLoader
+	StashLoader        *git_commands.StashLoader
+	TagLoader          *git_commands.TagLoader
+	Worktrees          *git_commands.WorktreeLoader
+}
+
 func NewGitCommand(
-	log *logrus.Entry,
+	cmn *common.Common,
+	version *git_commands.GitVersion,
 	osCommand *oscommands.OSCommand,
-	tr *i18n.TranslationSet,
-	config config.AppConfigurer,
 	gitConfig git_config.IGitConfig,
+	diffRendererConfigManager *config.DiffRendererConfigManager,
 ) (*GitCommand, error) {
-	var repo *gogit.Repository
-
-	pushToCurrent := gitConfig.Get("push.default") == "current"
-
-	if err := navigateToRepoRootDirectory(os.Stat, os.Chdir); err != nil {
-		return nil, err
-	}
-
-	var err error
-	if repo, err = setupRepository(gogit.PlainOpen, tr.GitconfigParseErr); err != nil {
-		return nil, err
-	}
-
-	dotGitDir, err := findDotGitDir(os.Stat, ioutil.ReadFile)
+	repoPaths, err := git_commands.GetRepoPaths(osCommand.Cmd, version)
 	if err != nil {
-		return nil, err
+		return nil, errors.Errorf("Error getting repo paths: %v", err)
 	}
 
-	gitCommand := &GitCommand{
-		Log:           log,
-		OSCommand:     osCommand,
-		Tr:            tr,
-		Repo:          repo,
-		Config:        config,
-		DotGitDir:     dotGitDir,
-		PushToCurrent: pushToCurrent,
-		GitConfig:     gitConfig,
-		GetCmdWriter:  func() io.Writer { return ioutil.Discard },
+	// A bare repo has no worktree for us to work in. Callers that can offer the
+	// user something better (app.setupRepo) check for this first; getting here
+	// means nobody could, e.g. because --git-dir was pointed at a bare repo.
+	if repoPaths.IsBareRepo() {
+		return nil, errors.New(cmn.Tr.BareRepoNotSupported)
 	}
 
-	gitCommand.PatchManager = patch.NewPatchManager(log, gitCommand.ApplyPatch, gitCommand.ShowFileDiff)
+	err = os.Chdir(repoPaths.WorktreePath())
+	if err != nil {
+		return nil, utils.WrapError(err)
+	}
 
-	return gitCommand, nil
+	// Everything we run through the command builder gets told where the repo is
+	// by the builder itself, but subprocesses don't go through it: user-defined
+	// custom commands, an editor, and the lazygit we re-enter as git's sequence
+	// editor during a rebase. Put it in the process env for those.
+	env.SetGitLocationEnvVars(repoPaths.GitLocationEnvVars())
+
+	// Pin the config reads to the repo directory like all other git commands
+	// (see NewGitCmdObjBuilder); the config commands run outside that builder.
+	gitConfig.SetDir(repoPaths.WorktreePath())
+
+	return NewGitCommandAux(
+		cmn,
+		version,
+		osCommand,
+		gitConfig,
+		repoPaths,
+		diffRendererConfigManager,
+	), nil
 }
 
-func (c *GitCommand) WithSpan(span string) *GitCommand {
-	// sometimes .WithSpan(span) will be called where span actually is empty, in
-	// which case we don't need to log anything so we can just return early here
-	// with the original struct
-	if span == "" {
-		return c
+func NewGitCommandAux(
+	cmn *common.Common,
+	version *git_commands.GitVersion,
+	osCommand *oscommands.OSCommand,
+	gitConfig git_config.IGitConfig,
+	repoPaths *git_commands.RepoPaths,
+	diffRendererConfigManager *config.DiffRendererConfigManager,
+) *GitCommand {
+	cmd := NewGitCmdObjBuilder(cmn.Log, osCommand.Cmd, repoPaths.WorktreePath(), repoPaths.GitLocationEnvVars())
+
+	// here we're doing a bunch of dependency injection for each of our commands structs.
+	// This is admittedly messy, but allows us to test each command struct in isolation,
+	// and allows for better namespacing when compared to having every method living
+	// on the one struct.
+	// common ones are: cmn, osCommand, dotGitDir, configCommands
+	configCommands := git_commands.NewConfigCommands(cmn, gitConfig)
+
+	gitCommon := git_commands.NewGitCommon(cmn, version, cmd, osCommand, repoPaths, configCommands, diffRendererConfigManager)
+
+	fileLoader := git_commands.NewFileLoader(gitCommon, cmd, configCommands)
+	statusCommands := git_commands.NewStatusCommands(gitCommon)
+	flowCommands := git_commands.NewFlowCommands(gitCommon)
+	remoteCommands := git_commands.NewRemoteCommands(gitCommon)
+	branchCommands := git_commands.NewBranchCommands(gitCommon)
+	syncCommands := git_commands.NewSyncCommands(gitCommon)
+	tagCommands := git_commands.NewTagCommands(gitCommon)
+	commitCommands := git_commands.NewCommitCommands(gitCommon)
+	customCommands := git_commands.NewCustomCommands(gitCommon)
+	diffCommands := git_commands.NewDiffCommands(gitCommon)
+	fileCommands := git_commands.NewFileCommands(gitCommon)
+	submoduleCommands := git_commands.NewSubmoduleCommands(gitCommon)
+	workingTreeCommands := git_commands.NewWorkingTreeCommands(gitCommon, submoduleCommands, fileLoader)
+	rebaseCommands := git_commands.NewRebaseCommands(gitCommon, commitCommands, workingTreeCommands)
+	stashCommands := git_commands.NewStashCommands(gitCommon, fileLoader, workingTreeCommands)
+	patchBuilder := patch.NewPatchBuilder(cmn.Log,
+		func(from string, to string, reverse bool, filename string, previousPath string) (string, error) {
+			// A patch is built from git's own diff: what a diff renderer would make of it
+			// is a picture of it, not something that can be applied.
+			return workingTreeCommands.ShowFileDiff(from, to, reverse, filename, previousPath, git_commands.DiffModePlain)
+		},
+		func() (string, error) {
+			// Under lazygit's own temp dir, so that it honours the configured location
+			// and is cleaned up with everything else when we exit.
+			return os.MkdirTemp(osCommand.GetTempDir(), "custom-patch-")
+		})
+	patchCommands := git_commands.NewPatchCommands(gitCommon, rebaseCommands, commitCommands, statusCommands, stashCommands, patchBuilder)
+	bisectCommands := git_commands.NewBisectCommands(gitCommon)
+	worktreeCommands := git_commands.NewWorktreeCommands(gitCommon)
+	blameCommands := git_commands.NewBlameCommands(gitCommon)
+	gitHubCommands := git_commands.NewGitHubCommands(gitCommon)
+	hostingServiceCommands := git_commands.NewHostingServiceCommand(gitCommon)
+
+	branchLoader := git_commands.NewBranchLoader(cmn, gitCommon, cmd, branchCommands.CurrentBranchInfo, branchCommands.HasLocalOnlyCommits, configCommands)
+	commitFileLoader := git_commands.NewCommitFileLoader(cmn, cmd)
+	commitLoader := git_commands.NewCommitLoader(cmn, cmd, statusCommands.WorkingTreeState, gitCommon)
+	reflogCommitLoader := git_commands.NewReflogCommitLoader(cmn, cmd)
+	remoteLoader := git_commands.NewRemoteLoader(gitCommon)
+	worktreeLoader := git_commands.NewWorktreeLoader(gitCommon)
+	stashLoader := git_commands.NewStashLoader(cmn, cmd)
+	tagLoader := git_commands.NewTagLoader(cmn, cmd)
+
+	return &GitCommand{
+		Blame:          blameCommands,
+		Branch:         branchCommands,
+		Commit:         commitCommands,
+		Config:         configCommands,
+		Custom:         customCommands,
+		Diff:           diffCommands,
+		File:           fileCommands,
+		Flow:           flowCommands,
+		Patch:          patchCommands,
+		Rebase:         rebaseCommands,
+		Remote:         remoteCommands,
+		Stash:          stashCommands,
+		Status:         statusCommands,
+		Submodule:      submoduleCommands,
+		Sync:           syncCommands,
+		Tag:            tagCommands,
+		Bisect:         bisectCommands,
+		WorkingTree:    workingTreeCommands,
+		Worktree:       worktreeCommands,
+		Version:        version,
+		GitHub:         gitHubCommands,
+		HostingService: hostingServiceCommands,
+		Loaders: Loaders{
+			BranchLoader:       branchLoader,
+			CommitFileLoader:   commitFileLoader,
+			CommitLoader:       commitLoader,
+			FileLoader:         fileLoader,
+			ReflogCommitLoader: reflogCommitLoader,
+			RemoteLoader:       remoteLoader,
+			Worktrees:          worktreeLoader,
+			StashLoader:        stashLoader,
+			TagLoader:          tagLoader,
+		},
+		RepoPaths: repoPaths,
 	}
-
-	newGitCommand := &GitCommand{}
-	*newGitCommand = *c
-	newGitCommand.OSCommand = c.OSCommand.WithSpan(span)
-
-	// NOTE: unlike the other things here which create shallow clones, this will
-	// actually update the PatchManager on the original struct to have the new span.
-	// This means each time we call ApplyPatch in PatchManager, we need to ensure
-	// we've called .WithSpan() ahead of time with the new span value
-	newGitCommand.PatchManager.ApplyPatch = newGitCommand.ApplyPatch
-
-	return newGitCommand
-}
-
-func navigateToRepoRootDirectory(stat func(string) (os.FileInfo, error), chdir func(string) error) error {
-	gitDir := env.GetGitDirEnv()
-	if gitDir != "" {
-		// we've been given the git directory explicitly so no need to navigate to it
-		_, err := stat(gitDir)
-		if err != nil {
-			return utils.WrapError(err)
-		}
-
-		return nil
-	}
-
-	// we haven't been given the git dir explicitly so we assume it's in the current working directory as `.git/` (or an ancestor directory)
-
-	for {
-		_, err := stat(".git")
-
-		if err == nil {
-			return nil
-		}
-
-		if !os.IsNotExist(err) {
-			return utils.WrapError(err)
-		}
-
-		if err = chdir(".."); err != nil {
-			return utils.WrapError(err)
-		}
-
-		currentPath, err := os.Getwd()
-		if err != nil {
-			return err
-		}
-
-		atRoot := currentPath == filepath.Dir(currentPath)
-		if atRoot {
-			// we should never really land here: the code that creates GitCommand should
-			// verify we're in a git directory
-			return errors.New("Must open lazygit in a git repository")
-		}
-	}
-}
-
-// resolvePath takes a path containing a symlink and returns the true path
-func resolvePath(path string) (string, error) {
-	l, err := os.Lstat(path)
-	if err != nil {
-		return "", err
-	}
-
-	if l.Mode()&os.ModeSymlink == 0 {
-		return path, nil
-	}
-
-	return filepath.EvalSymlinks(path)
-}
-
-func setupRepository(openGitRepository func(string) (*gogit.Repository, error), gitConfigParseErrorStr string) (*gogit.Repository, error) {
-	unresolvedPath := env.GetGitDirEnv()
-	if unresolvedPath == "" {
-		var err error
-		unresolvedPath, err = os.Getwd()
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	path, err := resolvePath(unresolvedPath)
-	if err != nil {
-		return nil, err
-	}
-
-	repository, err := openGitRepository(path)
-
-	if err != nil {
-		if strings.Contains(err.Error(), `unquoted '\' must be followed by new line`) {
-			return nil, errors.New(gitConfigParseErrorStr)
-		}
-
-		return nil, err
-	}
-
-	return repository, err
-}
-
-func findDotGitDir(stat func(string) (os.FileInfo, error), readFile func(filename string) ([]byte, error)) (string, error) {
-	if env.GetGitDirEnv() != "" {
-		return env.GetGitDirEnv(), nil
-	}
-
-	f, err := stat(".git")
-	if err != nil {
-		return "", err
-	}
-
-	if f.IsDir() {
-		return ".git", nil
-	}
-
-	fileBytes, err := readFile(".git")
-	if err != nil {
-		return "", err
-	}
-	fileContent := string(fileBytes)
-	if !strings.HasPrefix(fileContent, "gitdir: ") {
-		return "", errors.New(".git is a file which suggests we are in a submodule but the file's contents do not contain a gitdir pointing to the actual .git directory")
-	}
-	return strings.TrimSpace(strings.TrimPrefix(fileContent, "gitdir: ")), nil
 }
 
 func VerifyInGitRepo(osCommand *oscommands.OSCommand) error {
-	return osCommand.RunCommand("git rev-parse --git-dir")
-}
-
-func (c *GitCommand) RunCommand(formatString string, formatArgs ...interface{}) error {
-	_, err := c.RunCommandWithOutput(formatString, formatArgs...)
-	return err
-}
-
-func (c *GitCommand) RunCommandWithOutput(formatString string, formatArgs ...interface{}) (string, error) {
-	// TODO: have this retry logic in other places we run the command
-	waitTime := 50 * time.Millisecond
-	retryCount := 5
-	attempt := 0
-
-	for {
-		output, err := c.OSCommand.RunCommandWithOutput(formatString, formatArgs...)
-		if err != nil {
-			// if we have an error based on the index lock, we should wait a bit and then retry
-			if strings.Contains(output, ".git/index.lock") {
-				c.Log.Error(output)
-				c.Log.Info("index.lock prevented command from running. Retrying command after a small wait")
-				attempt++
-				time.Sleep(waitTime)
-				if attempt < retryCount {
-					continue
-				}
-			}
-		}
-		return output, err
-	}
-}
-
-func (c *GitCommand) NewCmdObjFromStr(cmdStr string) oscommands.ICmdObj {
-	return c.OSCommand.NewCmdObjFromStr(cmdStr).AddEnvVars("GIT_OPTIONAL_LOCKS=0")
+	return osCommand.Cmd.New(git_commands.NewGitCmd("rev-parse").Arg("--git-dir").ToArgv()).DontLog().Run()
 }
